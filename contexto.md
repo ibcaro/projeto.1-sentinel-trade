@@ -1,4 +1,3 @@
-contexto.md
 
 # Contexto do Sistema
 
