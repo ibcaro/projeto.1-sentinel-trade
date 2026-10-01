@@ -25,8 +25,3 @@ A Orion Capital hoje depende de sistemas pouco integrados, o que dificulta a ras
 - Notificação ao investidor sobre execução, rejeição, cancelamento ou falha
 - Recuperação de falhas e prevenção de duplicidade de ordens
 
-## Documentação
-
-- [Contexto do sistema](docs/contexto.md)
-- [Requisitos funcionais e não funcionais](docs/requisitos.md)
-- [Especificação de casos de uso](docs/casos_de_uso.md)
