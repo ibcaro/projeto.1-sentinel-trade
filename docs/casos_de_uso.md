@@ -1,6 +1,5 @@
 # Casos de Uso — SentinelTrade
-
-![Diagrama de Casos de Uso](diagrama_casos_de_uso.png)
+![Uploading image.png…]()
 
 ## Atores
 
