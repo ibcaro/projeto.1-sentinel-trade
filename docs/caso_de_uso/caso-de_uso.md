@@ -1,6 +1,6 @@
 # Casos de Uso — SentinelTrade
-![Uploading image.png…](<img width="442" height="356" alt="image" src="https://github.com/user-attachments/assets/c4bb207d-62fc-4dee-9648-14be2fd013f6" />
-)
+<img width="442" height="356" alt="image" src="https://github.com/user-attachments/assets/95988374-577d-4317-8263-eeb27a88960a" />
+
 
 ## Atores
 
