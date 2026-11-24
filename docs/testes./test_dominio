@@ -1,0 +1,236 @@
+"""Testes do domínio: validação de entradas, estados da ordem, risco e segurança."""
+import itertools
+import unittest
+from decimal import Decimal
+
+import tests as ajuda
+from sentineltrade.dominio import seguranca
+from sentineltrade.dominio import validacao as v
+from sentineltrade.dominio.entidades import Ordem
+from sentineltrade.dominio.erros import (
+    AutenticacaoError,
+    EntradaInvalidaError,
+    MercadoFechadoError,
+    PosicaoInsuficienteError,
+    RiscoExcedidoError,
+    SaldoInsuficienteError,
+    TransicaoInvalidaError,
+)
+from sentineltrade.dominio.estados import EstadoOrdem as E
+from sentineltrade.dominio.estados import TipoOrdem
+from sentineltrade.servicos.risco_saldo import ServicoRiscoSaldo
+
+def nova(**mudancas):
+    base = dict(
+        id=None, investidor_id=1, ativo="PETR4", tipo=TipoOrdem.COMPRA,
+        quantidade=10, preco="30.00", chave_idempotencia="chave-0001",
+    )
+    base.update(mudancas)
+    return Ordem(**base)
+
+
+class TesteValidacaoAtivo(unittest.TestCase):
+    def test_codigos_validos(self):
+        for codigo in ("PETR4", "VALE3", "ITUB4", "BOVA11", " petr4 "):
+            self.assertRegex(v.normalizar_codigo_ativo(codigo), r"^[A-Z]{4}[0-9]{1,2}$")
+
+    def test_codigos_invalidos_e_ataques(self):
+        for codigo in ("", "PET", "PETR", "PETR444", "PE1R4", "PETR4; DROP TABLE ordens",
+                       "PETR4' OR '1'='1", "../etc/passwd", "<script>", None, 123, "PE\nTR4", "PETR4\nX"):
+            with self.assertRaises(EntradaInvalidaError, msg=repr(codigo)):
+                v.normalizar_codigo_ativo(codigo)
+
+
+class TesteValidacaoQuantidadePreco(unittest.TestCase):
+    def test_quantidades_invalidas(self):
+        for q in (0, -1, 10_001, True, "10", 1.5, None):
+            with self.assertRaises(EntradaInvalidaError, msg=repr(q)):
+                v.validar_quantidade(q)
+
+    def test_quantidades_validas(self):
+        self.assertEqual(v.validar_quantidade(1), 1)
+        self.assertEqual(v.validar_quantidade(10_000), 10_000)
+
+    def test_precos_invalidos(self):
+        for p in (0, -1, "abc", "NaN", "Infinity", "1.234", True, None, "1e12"):
+            with self.assertRaises(EntradaInvalidaError, msg=repr(p)):
+                v.validar_preco(p)
+
+    def test_preco_valido_com_duas_casas(self):
+        self.assertEqual(v.validar_preco("30.5"), Decimal("30.50"))
+
+
+class TesteValidacaoOutros(unittest.TestCase):
+    def test_chave_idempotencia(self):
+        self.assertEqual(v.validar_chave_idempotencia("abc-12345_X"), "abc-12345_X")
+        for chave in ("curta", "com espaco 123", "a" * 65, "chave;drop", None):
+            with self.assertRaises(EntradaInvalidaError):
+                v.validar_chave_idempotencia(chave)
+
+    def test_email(self):
+        self.assertEqual(v.normalizar_email("  Fulano@Exemplo.COM "), "fulano@exemplo.com")
+        for email in ("semarroba", "a@b", "' OR 1=1 --@x.com", "a b@c.com", None):
+            with self.assertRaises(EntradaInvalidaError):
+                v.normalizar_email(email)
+
+    def test_codigo_mfa(self):
+        self.assertEqual(v.validar_codigo_mfa("123456"), "123456")
+        for codigo in ("12345", "1234567", "abcdef", "12 456", None):
+            with self.assertRaises(EntradaInvalidaError):
+                v.validar_codigo_mfa(codigo)
+
+
+class TesteOrdemEntidade(unittest.TestCase):
+    def test_ordem_valida(self):
+        ordem = nova(ativo="petr4")
+        self.assertEqual(ordem.ativo, "PETR4")
+        self.assertEqual(ordem.valor_total, Decimal("300.00"))
+
+    def test_ordem_com_dados_invalidos(self):
+        for mudanca in (dict(quantidade=0), dict(preco="-5"), dict(ativo="X"),
+                        dict(tipo="TROCA"), dict(chave_idempotencia="1")):
+            with self.assertRaises(EntradaInvalidaError, msg=str(mudanca)):
+                nova(**mudanca)
+
+
+PERMITIDAS = {
+    (E.PENDENTE, E.ENVIADA), (E.PENDENTE, E.REJEITADA), (E.PENDENTE, E.CANCELADA),
+    (E.ENVIADA, E.EXECUTADA), (E.ENVIADA, E.REJEITADA), (E.ENVIADA, E.FALHA),
+    (E.ENVIADA, E.CANCELADA),
+}
+
+
+def ordem_em(estado):
+    return Ordem(None, 1, "PETR4", TipoOrdem.COMPRA, 10, "30.00", "chave-0001", estado=estado)
+
+
+class TesteTransicoes(unittest.TestCase):
+    def test_matriz_completa_de_transicoes(self):
+        for origem, destino in itertools.product(E, E):
+            ordem = ordem_em(origem)
+            if (origem, destino) in PERMITIDAS:
+                ordem.transicionar(destino)
+                self.assertIs(ordem.estado, destino)
+            else:
+                with self.assertRaises(TransicaoInvalidaError, msg=f"{origem} -> {destino}"):
+                    ordem.transicionar(destino)
+                self.assertIs(ordem.estado, origem)  # estado preservado após a recusa
+
+    def test_estados_finais(self):
+        for final in (E.EXECUTADA, E.REJEITADA, E.FALHA, E.CANCELADA):
+            self.assertTrue(final.e_final)
+        self.assertFalse(E.PENDENTE.e_final)
+        self.assertFalse(E.ENVIADA.e_final)
+
+    def test_cancelamento_so_antes_do_desfecho(self):
+        self.assertTrue(E.PENDENTE.permite_cancelamento)
+        self.assertTrue(E.ENVIADA.permite_cancelamento)
+        self.assertFalse(E.EXECUTADA.permite_cancelamento)
+
+    def test_motivo_e_registrado(self):
+        ordem = ordem_em(E.PENDENTE)
+        ordem.transicionar(E.REJEITADA, motivo="Saldo insuficiente.")
+        self.assertEqual(ordem.motivo, "Saldo insuficiente.")
+
+
+class TesteRiscoSaldo(unittest.TestCase):
+    def setUp(self):
+        self.ctx, _ = ajuda.criar_ambiente()
+        self.servico = ServicoRiscoSaldo()
+
+    def _validar(self, investidor, ativo="PETR4", tipo=TipoOrdem.COMPRA, qtd=100, preco="30.00"):
+        ordem = Ordem(None, investidor.id, ativo, tipo, qtd, preco, "chave-0001")
+        self.servico.validar(investidor, ordem, self.ctx.ativos.buscar_por_codigo(ativo))
+
+    def test_compra_aprovada(self):
+        inv, _ = ajuda.criar_investidor(self.ctx)
+        self._validar(inv)  # 100 x 30 = 3000, dentro do saldo e do limite
+
+    def test_mercado_fechado(self):
+        inv, _ = ajuda.criar_investidor(self.ctx)
+        with self.assertRaises(MercadoFechadoError):
+            self._validar(inv, ativo="MGLU3", qtd=1, preco="10.00")
+
+    def test_limite_de_risco_excedido(self):
+        inv, _ = ajuda.criar_investidor(self.ctx, saldo="100000.00", limite="5000.00")
+        with self.assertRaises(RiscoExcedidoError):
+            self._validar(inv, qtd=200)  # 6000 > 5000
+
+    def test_limite_exato_e_permitido(self):
+        inv, _ = ajuda.criar_investidor(self.ctx, saldo="100000.00", limite="3000.00")
+        self._validar(inv, qtd=100)  # 3000 == limite
+
+    def test_saldo_insuficiente(self):
+        inv, _ = ajuda.criar_investidor(self.ctx, saldo="100.00")
+        with self.assertRaises(SaldoInsuficienteError):
+            self._validar(inv, qtd=10)
+
+    def test_venda_aprovada_e_posicao_insuficiente(self):
+        inv, _ = ajuda.criar_investidor(self.ctx, posicoes={"PETR4": 50})
+        self._validar(inv, tipo=TipoOrdem.VENDA, qtd=50)
+        with self.assertRaises(PosicaoInsuficienteError):
+            self._validar(inv, tipo=TipoOrdem.VENDA, qtd=51)
+
+    def test_venda_de_ativo_que_nao_possui(self):
+        inv, _ = ajuda.criar_investidor(self.ctx)
+        with self.assertRaises(PosicaoInsuficienteError):
+            self._validar(inv, ativo="VALE3", tipo=TipoOrdem.VENDA, qtd=1, preco="60.00")
+
+
+SEGREDO_RFC = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # "12345678901234567890" em base32 (RFC 6238)
+
+
+class TesteSenha(unittest.TestCase):
+    def test_hash_e_verificacao(self):
+        h = seguranca.gerar_hash_senha("minha-senha-1")
+        self.assertNotIn("minha-senha-1", h)
+        self.assertTrue(seguranca.verificar_senha("minha-senha-1", h))
+        self.assertFalse(seguranca.verificar_senha("outra-senha-1", h))
+
+    def test_hashes_diferentes_para_mesma_senha(self):
+        self.assertNotEqual(seguranca.gerar_hash_senha("abc12345"), seguranca.gerar_hash_senha("abc12345"))
+
+    def test_hash_corrompido_nao_autentica(self):
+        self.assertFalse(seguranca.verificar_senha("x", "lixo"))
+
+
+class TesteTotp(unittest.TestCase):
+    def test_vetores_oficiais_rfc6238(self):
+        self.assertEqual(seguranca.gerar_codigo_totp(SEGREDO_RFC, agora=59), "287082")
+        self.assertEqual(seguranca.gerar_codigo_totp(SEGREDO_RFC, agora=1111111109), "081804")
+
+    def test_verificacao_devolve_passo(self):
+        self.assertEqual(seguranca.verificar_totp(SEGREDO_RFC, "287082", agora=59), 1)
+
+    def test_codigo_errado_ou_fora_da_janela(self):
+        self.assertIsNone(seguranca.verificar_totp(SEGREDO_RFC, "000000", agora=59))
+        self.assertIsNone(seguranca.verificar_totp(SEGREDO_RFC, "287082", agora=59 + 300))
+
+
+class TesteToken(unittest.TestCase):
+    CHAVE = b"c" * 40
+
+    def test_token_valido(self):
+        t = seguranca.emitir_token(self.CHAVE, 7, agora=1000)
+        self.assertEqual(seguranca.validar_token(self.CHAVE, t, agora=1001), 7)
+
+    def test_token_expirado(self):
+        t = seguranca.emitir_token(self.CHAVE, 7, validade_s=60, agora=1000)
+        with self.assertRaises(AutenticacaoError):
+            seguranca.validar_token(self.CHAVE, t, agora=1061)
+
+    def test_token_adulterado(self):
+        t = seguranca.emitir_token(self.CHAVE, 7, agora=1000)
+        corpo, assinatura = t.split(".")
+        for falso in (corpo + "." + assinatura[:-2] + "AA", "x" + t, "lixo", ""):
+            with self.assertRaises(AutenticacaoError):
+                seguranca.validar_token(self.CHAVE, falso, agora=1001)
+
+    def test_token_de_outra_chave(self):
+        t = seguranca.emitir_token(b"d" * 40, 7, agora=1000)
+        with self.assertRaises(AutenticacaoError):
+            seguranca.validar_token(self.CHAVE, t, agora=1001)
+
+
+if __name__ == "__main__":
+    unittest.main()
