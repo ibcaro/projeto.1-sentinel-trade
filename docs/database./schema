@@ -1,0 +1,75 @@
+-- SentinelTrade: esquema relacional (SQLite).
+-- Valores monetários em TEXT (Decimal) para evitar erro de ponto flutuante.
+
+CREATE TABLE IF NOT EXISTS usuarios (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    email             TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    senha_hash        TEXT    NOT NULL,
+    segredo_mfa       TEXT    NOT NULL,
+    perfil            TEXT    NOT NULL CHECK (perfil IN ('INVESTIDOR', 'ADMINISTRADOR')),
+    falhas_login      INTEGER NOT NULL DEFAULT 0 CHECK (falhas_login >= 0),
+    bloqueado_ate     REAL,
+    ultimo_passo_mfa  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS contas (
+    investidor_id       INTEGER PRIMARY KEY REFERENCES usuarios (id),
+    saldo_disponivel    TEXT NOT NULL,
+    saldo_reservado     TEXT NOT NULL,
+    limite_valor_ordem  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ativos (
+    codigo          TEXT PRIMARY KEY CHECK (length(codigo) BETWEEN 5 AND 6),
+    nome            TEXT NOT NULL,
+    preco_atual     TEXT NOT NULL,
+    mercado_aberto  INTEGER NOT NULL CHECK (mercado_aberto IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS posicoes (
+    investidor_id         INTEGER NOT NULL REFERENCES usuarios (id),
+    ativo_codigo          TEXT    NOT NULL REFERENCES ativos (codigo),
+    quantidade            INTEGER NOT NULL CHECK (quantidade >= 0),
+    quantidade_reservada  INTEGER NOT NULL DEFAULT 0
+        CHECK (quantidade_reservada >= 0 AND quantidade_reservada <= quantidade),
+    PRIMARY KEY (investidor_id, ativo_codigo)
+);
+
+CREATE TABLE IF NOT EXISTS ordens (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    investidor_id       INTEGER NOT NULL REFERENCES usuarios (id),
+    ativo_codigo        TEXT    NOT NULL REFERENCES ativos (codigo),
+    tipo                TEXT    NOT NULL CHECK (tipo IN ('COMPRA', 'VENDA')),
+    quantidade          INTEGER NOT NULL CHECK (quantidade > 0),
+    preco               TEXT    NOT NULL,
+    chave_idempotencia  TEXT    NOT NULL,
+    estado              TEXT    NOT NULL CHECK (estado IN
+        ('PENDENTE', 'ENVIADA', 'EXECUTADA', 'REJEITADA', 'FALHA', 'CANCELADA')),
+    motivo              TEXT,
+    criada_em           TEXT    NOT NULL,
+    -- prevenção de duplicidade: a mesma chave não gera duas ordens do mesmo investidor
+    UNIQUE (investidor_id, chave_idempotencia)
+);
+CREATE INDEX IF NOT EXISTS idx_ordens_investidor ON ordens (investidor_id, estado);
+
+-- Log de auditoria imutável: append-only, com encadeamento de hash.
+CREATE TABLE IF NOT EXISTS logs_auditoria (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    usuario        TEXT NOT NULL,
+    acao           TEXT NOT NULL,
+    data_hora      TEXT NOT NULL,
+    id_ordem       INTEGER,
+    hash_anterior  TEXT NOT NULL UNIQUE,
+    hash           TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_logs_data ON logs_auditoria (data_hora);
+
+CREATE TRIGGER IF NOT EXISTS logs_sem_update BEFORE UPDATE ON logs_auditoria
+BEGIN
+    SELECT RAISE(ABORT, 'logs_auditoria e append-only: alteracao proibida');
+END;
+
+CREATE TRIGGER IF NOT EXISTS logs_sem_delete BEFORE DELETE ON logs_auditoria
+BEGIN
+    SELECT RAISE(ABORT, 'logs_auditoria e append-only: remocao proibida');
+END;
