@@ -1,0 +1,46 @@
+"""Ponto de entrada do SentinelTrade.
+
+    python main.py          inicia a API
+    python main.py seed     cria dados de demonstração (ativos, administrador e investidor)
+"""
+import os
+import sys
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent
+sys.path.insert(0, str(RAIZ / "src"))
+
+
+def carregar_env(caminho: Path) -> None:
+    """Lê o arquivo .env (CHAVE=valor). Variáveis já definidas no ambiente têm prioridade."""
+    if not caminho.is_file():
+        return
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("#") or "=" not in linha:
+            continue
+        chave, _, valor = linha.partition("=")
+        os.environ.setdefault(chave.strip(), valor.strip())
+
+
+def main() -> None:
+    carregar_env(RAIZ / ".env")
+    if len(sys.argv) > 1 and sys.argv[1] == "seed":
+        from sentineltrade.api.contexto import criar_contexto_do_ambiente
+        from sentineltrade.persistencia.seed import executar
+
+        executar(criar_contexto_do_ambiente())
+        return
+
+    import uvicorn
+
+    uvicorn.run(
+        "sentineltrade.api.main:criar_app",
+        factory=True,
+        host=os.environ.get("SENTINEL_HOST", "127.0.0.1"),
+        port=int(os.environ.get("SENTINEL_PORT", "8000")),
+    )
+
+
+if __name__ == "__main__":
+    main()
