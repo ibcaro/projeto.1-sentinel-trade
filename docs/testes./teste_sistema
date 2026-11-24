@@ -1,0 +1,435 @@
+"""Testes do sistema: ordens, autenticação, auditoria e persistência (com banco em memória)."""
+import sqlite3
+import unittest
+from decimal import Decimal
+
+import tests as ajuda
+from tests import dados
+from sentineltrade.dominio import seguranca
+from sentineltrade.dominio.entidades import HASH_INICIAL, Administrador, Investidor, Ordem
+from sentineltrade.dominio.erros import (
+    AcessoNegadoError,
+    AtivoInexistenteError,
+    AutenticacaoError,
+    CancelamentoRecusadoError,
+    EntradaInvalidaError,
+    MercadoFechadoError,
+    OrdemDuplicadaError,
+    OrdemInexistenteError,
+    PosicaoInsuficienteError,
+    RiscoExcedidoError,
+    SaldoInsuficienteError,
+    TransicaoInvalidaError,
+)
+from sentineltrade.dominio.estados import EstadoOrdem as E
+from sentineltrade.dominio.estados import TipoOrdem
+from sentineltrade.integracoes.bolsa import BolsaSimulada
+from sentineltrade.servicos.auditoria import AcaoAuditoria, FiltroLog
+
+class BolsaRespostaInvalida(BolsaSimulada):
+    def enviar(self, ordem):
+        return E.PENDENTE  # resposta fora do contrato
+
+
+class Base(unittest.TestCase):
+    def preparar(self, bolsa=None, **kwargs):
+        self.ctx, self.relogio = ajuda.criar_ambiente(bolsa)
+        self.inv, _ = ajuda.criar_investidor(self.ctx, **kwargs)
+        self.servico = self.ctx.servico_ordem
+
+    def recarregar(self):
+        return self.ctx.usuarios.buscar_por_id(self.inv.id)
+
+
+class TesteEnviarOrdem(Base):
+    def test_compra_executada_atualiza_saldo_e_carteira(self):
+        self.preparar()
+        ordem = self.servico.enviar_ordem(self.inv.id, dados())
+        self.assertIs(ordem.estado, E.EXECUTADA)
+        inv = self.recarregar()
+        self.assertEqual(inv.conta.saldo_disponivel, Decimal("7000.00"))
+        self.assertEqual(inv.conta.saldo_reservado, Decimal("0"))
+        self.assertEqual(inv.carteira.quantidade_total("PETR4"), 100)
+
+    def test_venda_executada_credita_saldo(self):
+        self.preparar(posicoes={"PETR4": 50})
+        ordem = self.servico.enviar_ordem(self.inv.id, dados(tipo=TipoOrdem.VENDA, quantidade=20))
+        self.assertIs(ordem.estado, E.EXECUTADA)
+        inv = self.recarregar()
+        self.assertEqual(inv.conta.saldo_disponivel, Decimal("10600.00"))
+        self.assertEqual(inv.carteira.quantidade_total("PETR4"), 30)
+        self.assertEqual(inv.carteira.reservadas, {})
+
+    def test_rejeicoes_de_negocio_ficam_registradas(self):
+        casos = [
+            (dict(ativo="MGLU3", quantidade=1, preco="10.00"), MercadoFechadoError),
+            (dict(quantidade=200), RiscoExcedidoError),  # 6000 > limite 5000
+            (dict(tipo=TipoOrdem.VENDA, quantidade=1), PosicaoInsuficienteError),
+        ]
+        for i, (mudanca, erro) in enumerate(casos):
+            self.preparar(saldo="100000.00")
+            with self.assertRaises(erro):
+                self.servico.enviar_ordem(self.inv.id, dados(chave=f"chave-rej-{i}", **mudanca))
+            ordens = self.servico.listar_ordens(self.inv.id)
+            self.assertEqual([o.estado for o in ordens], [E.REJEITADA])
+            self.assertIn("ORDEM_REJEITADA", ajuda.acoes_do_log(self.ctx))
+            self.assertEqual(self.recarregar().conta.saldo_disponivel, Decimal("100000.00"))
+
+    def test_saldo_insuficiente(self):
+        self.preparar(saldo="100.00")
+        with self.assertRaises(SaldoInsuficienteError):
+            self.servico.enviar_ordem(self.inv.id, dados(quantidade=10))
+        self.assertEqual(self.recarregar().conta.saldo_disponivel, Decimal("100.00"))
+
+    def test_ordem_duplicada_nao_executa_duas_vezes(self):
+        self.preparar()
+        self.servico.enviar_ordem(self.inv.id, dados(chave="mesma-chave-1"))
+        with self.assertRaises(OrdemDuplicadaError):
+            self.servico.enviar_ordem(self.inv.id, dados(chave="mesma-chave-1"))
+        self.assertEqual(len(self.servico.listar_ordens(self.inv.id)), 1)
+        self.assertEqual(self.recarregar().conta.saldo_disponivel, Decimal("7000.00"))
+
+    def test_mesma_chave_em_investidores_diferentes_e_permitida(self):
+        self.preparar()
+        outro, _ = ajuda.criar_investidor(self.ctx, email="outro@teste.com")
+        self.servico.enviar_ordem(self.inv.id, dados(chave="mesma-chave-1"))
+        self.servico.enviar_ordem(outro.id, dados(chave="mesma-chave-1"))
+
+    def test_entradas_invalidas_nao_geram_ordem(self):
+        self.preparar()
+        for mudanca in (dict(quantidade=0), dict(preco="0"), dict(ativo="PETR4;DROP"),
+                        dict(chave="1")):
+            with self.assertRaises(EntradaInvalidaError):
+                self.servico.enviar_ordem(self.inv.id, dados(**mudanca))
+        self.assertEqual(self.servico.listar_ordens(self.inv.id), [])
+
+    def test_ativo_inexistente(self):
+        self.preparar()
+        with self.assertRaises(AtivoInexistenteError):
+            self.servico.enviar_ordem(self.inv.id, dados(ativo="ZZZZ9"))
+
+    def test_falha_transitoria_da_bolsa_e_recuperada_por_reenvio(self):
+        self.preparar(bolsa=BolsaSimulada(falhas_transitorias=2))
+        ordem = self.servico.enviar_ordem(self.inv.id, dados())
+        self.assertIs(ordem.estado, E.EXECUTADA)
+        self.assertEqual(self.recarregar().conta.saldo_disponivel, Decimal("7000.00"))
+
+    def test_bolsa_fora_do_ar_deixa_ordem_em_falha_e_devolve_saldo(self):
+        self.preparar(bolsa=BolsaSimulada(falhas_transitorias=99))
+        ordem = self.servico.enviar_ordem(self.inv.id, dados())
+        self.assertIs(ordem.estado, E.FALHA)
+        inv = self.recarregar()
+        self.assertEqual(inv.conta.saldo_disponivel, Decimal("10000.00"))
+        self.assertEqual(inv.conta.saldo_reservado, Decimal("0"))
+        self.assertIn("ALERTA_FALHA_BOLSA", ajuda.acoes_do_log(self.ctx))
+
+    def test_resposta_invalida_da_bolsa_e_tratada_como_falha(self):
+        self.preparar(bolsa=BolsaRespostaInvalida())
+        ordem = self.servico.enviar_ordem(self.inv.id, dados())
+        self.assertIs(ordem.estado, E.FALHA)
+
+    def test_rejeicao_pela_bolsa_libera_reserva(self):
+        self.preparar(bolsa=BolsaSimulada(ativos_rejeitados={"VALE3"}))
+        ordem = self.servico.enviar_ordem(self.inv.id, dados(ativo="VALE3", quantidade=10, preco="60.00"))
+        self.assertIs(ordem.estado, E.REJEITADA)
+        inv = self.recarregar()
+        self.assertEqual(inv.conta.saldo_disponivel, Decimal("10000.00"))
+        self.assertEqual(inv.conta.saldo_reservado, Decimal("0"))
+
+    def test_toda_ordem_gera_trilha_de_auditoria(self):
+        self.preparar()
+        self.servico.enviar_ordem(self.inv.id, dados())
+        self.assertEqual(ajuda.acoes_do_log(self.ctx), ["ORDEM_ENVIADA", "ORDEM_EXECUTADA"])
+        self.assertTrue(self.ctx.auditoria.verificar_integridade())
+
+
+class TesteCancelarEConsultar(Base):
+    def _ordem_enviada(self):
+        """Cria uma ordem ENVIADA (aguardando a Bolsa) com saldo reservado."""
+        ordem = Ordem(None, self.inv.id, "PETR4", TipoOrdem.COMPRA, 10, "30.00", "chave-0009")
+        self.ctx.ordens.salvar(ordem)
+        ordem.transicionar(E.ENVIADA)
+        self.ctx.ordens.salvar(ordem)
+        inv = self.recarregar()
+        inv.conta.reservar(ordem.valor_total)
+        self.ctx.usuarios.salvar(inv)
+        return ordem
+
+    def test_cancelar_ordem_enviada_libera_saldo(self):
+        self.preparar()
+        ordem = self._ordem_enviada()
+        cancelada = self.servico.cancelar_ordem(self.inv.id, ordem.id)
+        self.assertIs(cancelada.estado, E.CANCELADA)
+        inv = self.recarregar()
+        self.assertEqual(inv.conta.saldo_disponivel, Decimal("10000.00"))
+        self.assertEqual(inv.conta.saldo_reservado, Decimal("0"))
+        self.assertIn("ORDEM_CANCELADA", ajuda.acoes_do_log(self.ctx))
+
+    def test_nao_cancela_ordem_em_estado_final(self):
+        self.preparar()
+        ordem = self.servico.enviar_ordem(self.inv.id, dados())  # EXECUTADA
+        with self.assertRaises(TransicaoInvalidaError):
+            self.servico.cancelar_ordem(self.inv.id, ordem.id)
+        self.assertIs(self.servico.obter_ordem(self.inv.id, ordem.id).estado, E.EXECUTADA)
+        self.assertIn("TRANSICAO_INVALIDA", ajuda.acoes_do_log(self.ctx))
+
+    def test_nao_cancela_ordem_de_outro_investidor(self):
+        self.preparar()
+        outro, _ = ajuda.criar_investidor(self.ctx, email="outro@teste.com")
+        ordem = self._ordem_enviada()
+        with self.assertRaises(OrdemInexistenteError):
+            self.servico.cancelar_ordem(outro.id, ordem.id)
+        with self.assertRaises(OrdemInexistenteError):
+            self.servico.cancelar_ordem(self.inv.id, 99999)
+        self.assertIs(self.servico.obter_ordem(self.inv.id, ordem.id).estado, E.ENVIADA)
+
+    def test_bolsa_recusa_cancelamento_de_ordem_ja_processada(self):
+        bolsa = BolsaSimulada()
+        self.preparar(bolsa=bolsa)
+        ordem = self._ordem_enviada()
+        bolsa.enviar(ordem)  # a Bolsa já processou
+        with self.assertRaises(CancelamentoRecusadoError):
+            self.servico.cancelar_ordem(self.inv.id, ordem.id)
+        self.assertIs(self.servico.obter_ordem(self.inv.id, ordem.id).estado, E.ENVIADA)
+
+    def test_consultas_so_mostram_ordens_do_proprio_investidor(self):
+        self.preparar()
+        outro, _ = ajuda.criar_investidor(self.ctx, email="outro@teste.com")
+        minha = self.servico.enviar_ordem(self.inv.id, dados(chave="chave-minha-1"))
+        self.servico.enviar_ordem(outro.id, dados(chave="chave-outro-1"))
+        self.assertEqual([o.id for o in self.servico.listar_ordens(self.inv.id)], [minha.id])
+        with self.assertRaises(OrdemInexistenteError):
+            self.servico.obter_ordem(outro.id, minha.id)
+
+    def test_filtro_por_estado_e_paginacao_validados(self):
+        self.preparar()
+        self.servico.enviar_ordem(self.inv.id, dados(chave="chave-aaaa-1"))
+        self.assertEqual(len(self.servico.listar_ordens(self.inv.id, estado="EXECUTADA")), 1)
+        self.assertEqual(self.servico.listar_ordens(self.inv.id, estado=E.CANCELADA), [])
+        for erro in (dict(estado="QUALQUER"), dict(limite=0), dict(limite=101), dict(deslocamento=-1)):
+            with self.assertRaises(EntradaInvalidaError):
+                self.servico.listar_ordens(self.inv.id, **erro)
+
+
+class TesteAutenticacao(unittest.TestCase):
+    def setUp(self):
+        self.ctx, self.relogio = ajuda.criar_ambiente()
+        self.inv, self.segredo = ajuda.criar_investidor(self.ctx)
+        self.auth = self.ctx.autenticacao
+
+    def codigo(self):
+        return seguranca.gerar_codigo_totp(self.segredo, self.relogio())
+
+    def codigo_errado(self):
+        return "000000" if self.codigo() != "000000" else "111111"
+
+    def tentar(self, email="inv@teste.com", senha=ajuda.SENHA, codigo=None):
+        return self.auth.autenticar(email, senha, codigo or self.codigo())
+
+    def test_login_com_senha_e_segundo_fator(self):
+        token = self.tentar()
+        usuario = self.auth.usuario_do_token(token)
+        self.assertEqual(usuario.id, self.inv.id)
+        self.assertIsInstance(usuario, Investidor)
+        self.assertIn("LOGIN_OK", ajuda.acoes_do_log(self.ctx))
+
+    def test_perfil_vem_do_banco(self):
+        admin, segredo = ajuda.criar_administrador(self.ctx)
+        codigo = seguranca.gerar_codigo_totp(segredo, self.relogio())
+        token = self.auth.autenticar("admin@teste.com", ajuda.SENHA, codigo)
+        self.assertIsInstance(self.auth.usuario_do_token(token), Administrador)
+
+    def test_todas_as_falhas_tem_a_mesma_mensagem(self):
+        mensagens = set()
+        casos = [
+            dict(email="naoexiste@teste.com"),
+            dict(senha="senha-errada-123"),
+            dict(codigo=self.codigo_errado()),
+            dict(email="isto-nao-e-email"),
+            dict(senha="curta"),
+            dict(codigo="abc"),
+        ]
+        for caso in casos:
+            with self.assertRaises(AutenticacaoError) as ctx:
+                self.tentar(**caso)
+            mensagens.add(str(ctx.exception))
+            self.relogio.avancar(1)
+        self.assertEqual(mensagens, {"Credenciais inválidas."})
+
+    def test_codigo_nao_pode_ser_reutilizado(self):
+        self.tentar()
+        with self.assertRaises(AutenticacaoError):
+            self.tentar()  # mesmo código, mesmo instante: repetição bloqueada
+        self.relogio.avancar(30)
+        self.tentar()  # código novo funciona
+
+    def test_bloqueio_apos_tentativas_excessivas(self):
+        for _ in range(5):
+            with self.assertRaises(AutenticacaoError):
+                self.tentar(senha="senha-errada-123")
+        self.relogio.avancar(30)
+        with self.assertRaises(AutenticacaoError):  # credenciais certas, mas conta bloqueada
+            self.tentar()
+        self.assertIn("LOGIN_BLOQUEADO", ajuda.acoes_do_log(self.ctx))
+        self.relogio.avancar(15 * 60 + 1)
+        self.assertTrue(self.tentar())  # bloqueio expirou
+
+    def test_sucesso_zera_contador_de_falhas(self):
+        for _ in range(4):
+            with self.assertRaises(AutenticacaoError):
+                self.tentar(senha="senha-errada-123")
+        self.relogio.avancar(30)
+        self.tentar()
+        self.assertEqual(self.ctx.usuarios.buscar_por_id(self.inv.id).falhas_login, 0)
+
+    def test_token_expira(self):
+        token = self.tentar()
+        self.relogio.avancar(901)
+        with self.assertRaises(AutenticacaoError):
+            self.auth.usuario_do_token(token)
+
+    def test_log_nao_guarda_segredos(self):
+        self.tentar()
+        with self.assertRaises(AutenticacaoError):
+            self.tentar(senha="senha-errada-123")
+        texto = " ".join(f"{r.usuario} {r.acao}" for r in self.ctx.logs.todos())
+        for segredo in (ajuda.SENHA, "senha-errada-123", self.segredo):
+            self.assertNotIn(segredo, texto)
+
+
+class TesteAuditoria(unittest.TestCase):
+    def setUp(self):
+        self.ctx, _ = ajuda.criar_ambiente()
+        self.aud = self.ctx.auditoria
+
+    def test_cadeia_de_hash(self):
+        a = self.aud.registrar("1", AcaoAuditoria.ORDEM_ENVIADA, 10)
+        b = self.aud.registrar("1", AcaoAuditoria.ORDEM_EXECUTADA, 10)
+        self.assertEqual(a.hash_anterior, HASH_INICIAL)
+        self.assertEqual(b.hash_anterior, a.hash)
+        self.assertNotEqual(a.hash, b.hash)
+        self.assertTrue(self.aud.verificar_integridade())
+
+    def test_log_vazio_e_integro(self):
+        self.assertTrue(self.aud.verificar_integridade())
+
+    def test_banco_recusa_alterar_ou_apagar_registros(self):
+        self.aud.registrar("1", AcaoAuditoria.LOGIN_OK)
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.ctx.db.executar("UPDATE logs_auditoria SET usuario = 'x'")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.ctx.db.executar("DELETE FROM logs_auditoria")
+        self.assertEqual(len(self.ctx.logs.todos()), 1)
+
+    def test_adulteracao_e_detectada_mesmo_sem_protecao_do_banco(self):
+        for i in range(3):
+            self.aud.registrar("1", AcaoAuditoria.ORDEM_ENVIADA, i + 1)
+        self.ctx.db.executar("DROP TRIGGER logs_sem_update")  # atacante com acesso ao banco
+        self.ctx.db.executar("UPDATE logs_auditoria SET id_ordem = 999 WHERE id = 2")
+        self.assertFalse(self.aud.verificar_integridade())
+
+    def test_remocao_de_registro_e_detectada(self):
+        for i in range(3):
+            self.aud.registrar("1", AcaoAuditoria.ORDEM_ENVIADA, i + 1)
+        self.ctx.db.executar("DROP TRIGGER logs_sem_delete")
+        self.ctx.db.executar("DELETE FROM logs_auditoria WHERE id = 2")
+        self.assertFalse(self.aud.verificar_integridade())
+
+    def test_acao_fora_da_lista_e_recusada(self):
+        with self.assertRaises(ValueError):
+            self.aud.registrar("1", "SENHA_DO_USUARIO=123")
+
+    def test_usuario_suspeito_e_neutralizado(self):
+        r = self.aud.registrar("1\nFALSO LOG | admin", AcaoAuditoria.LOGIN_FALHA)
+        self.assertEqual(r.usuario, "invalido")
+
+    def test_administrador_consulta_e_a_consulta_e_auditada(self):
+        admin, _ = ajuda.criar_administrador(self.ctx)
+        self.aud.registrar("1", AcaoAuditoria.ORDEM_ENVIADA, 5)
+        resultado = self.aud.consultar_como_administrador(admin, FiltroLog())
+        self.assertEqual([r.acao for r in resultado], ["ORDEM_ENVIADA"])
+        self.assertEqual(ajuda.acoes_do_log(self.ctx)[-1], "LOGS_CONSULTADOS")
+
+    def test_investidor_nao_consulta_logs(self):
+        inv, _ = ajuda.criar_investidor(self.ctx)
+        with self.assertRaises(AcessoNegadoError):
+            self.aud.consultar_como_administrador(inv, FiltroLog())
+        self.assertEqual(ajuda.acoes_do_log(self.ctx), ["ACESSO_NEGADO"])
+
+    def test_filtros(self):
+        admin, _ = ajuda.criar_administrador(self.ctx)
+        self.aud.registrar("1", AcaoAuditoria.ORDEM_ENVIADA, 5)
+        self.aud.registrar("2", AcaoAuditoria.ORDEM_ENVIADA, 6)
+        self.assertEqual(len(self.aud.consultar_como_administrador(admin, FiltroLog(usuario="2"))), 1)
+        self.assertEqual(len(self.aud.consultar_como_administrador(admin, FiltroLog(id_ordem=5))), 1)
+        self.assertEqual(self.aud.consultar_como_administrador(admin, FiltroLog(id_ordem=77)), [])
+
+    def test_filtros_invalidos_sao_recusados(self):
+        for kwargs in (dict(usuario="a' OR '1'='1"), dict(id_ordem=0), dict(id_ordem="1; DROP"),
+                       dict(limite=0), dict(limite=201), dict(inicio="ontem"),
+                       dict(inicio="2030-01-02", fim="2030-01-01")):
+            with self.assertRaises(EntradaInvalidaError, msg=str(kwargs)):
+                FiltroLog(**kwargs)
+
+    def test_filtro_por_periodo(self):
+        admin, _ = ajuda.criar_administrador(self.ctx)
+        self.aud.registrar("1", AcaoAuditoria.LOGIN_OK)
+        futuro = FiltroLog(inicio="2999-01-01")
+        self.assertEqual(self.aud.consultar_como_administrador(admin, futuro), [])
+        passado = FiltroLog(inicio="2000-01-01", fim="2999-01-01")
+        acoes = [r.acao for r in self.aud.consultar_como_administrador(admin, passado)]
+        # a consulta anterior do administrador também foi registrada no log
+        self.assertEqual(sorted(acoes), ["LOGIN_OK", "LOGS_CONSULTADOS"])
+
+
+class TestePersistencia(unittest.TestCase):
+    def setUp(self):
+        self.ctx, _ = ajuda.criar_ambiente()
+
+    def test_sql_injection_em_busca_de_usuario(self):
+        ajuda.criar_investidor(self.ctx)
+        for entrada in ("' OR '1'='1", "x@y.com' OR 1=1 --", "inv@teste.com'; DROP TABLE usuarios; --"):
+            self.assertIsNone(self.ctx.usuarios.buscar_por_email(entrada))
+        self.assertIsNotNone(self.ctx.usuarios.buscar_por_email("INV@teste.com"))  # sem diferenciar maiúsculas
+
+    def test_sql_injection_em_busca_de_ativo(self):
+        self.assertIsNone(self.ctx.ativos.buscar_por_codigo("PETR4' OR '1'='1"))
+        self.assertIsNotNone(self.ctx.ativos.buscar_por_codigo("petr4"))
+
+    def test_estado_financeiro_e_persistido(self):
+        inv, _ = ajuda.criar_investidor(self.ctx, saldo="1234.56", limite="999.99", posicoes={"PETR4": 7})
+        lido = self.ctx.usuarios.buscar_por_id(inv.id)
+        self.assertEqual(lido.conta.saldo_disponivel, Decimal("1234.56"))
+        self.assertEqual(lido.limite.valor_maximo_por_ordem, Decimal("999.99"))
+        self.assertEqual(lido.carteira.posicoes, {"PETR4": 7})
+
+    def test_email_duplicado_e_recusado(self):
+        ajuda.criar_investidor(self.ctx)
+        with self.assertRaises(EntradaInvalidaError):
+            ajuda.criar_investidor(self.ctx)
+
+    def test_banco_tem_restricoes_proprias(self):
+        inv, _ = ajuda.criar_investidor(self.ctx)
+        invalidos = [
+            "INSERT INTO ordens (investidor_id, ativo_codigo, tipo, quantidade, preco, "
+            "chave_idempotencia, estado, criada_em) VALUES (1,'PETR4','COMPRA',0,'1','chave-0001','PENDENTE','x')",
+            "INSERT INTO ordens (investidor_id, ativo_codigo, tipo, quantidade, preco, "
+            "chave_idempotencia, estado, criada_em) VALUES (1,'PETR4','COMPRA',1,'1','chave-0001','INVENTADO','x')",
+            "INSERT INTO ordens (investidor_id, ativo_codigo, tipo, quantidade, preco, "
+            "chave_idempotencia, estado, criada_em) VALUES (999,'PETR4','COMPRA',1,'1','chave-0001','PENDENTE','x')",
+        ]
+        for sql in invalidos:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.ctx.db.executar(sql)
+
+    def test_transacao_desfaz_tudo_em_caso_de_erro(self):
+        inv, _ = ajuda.criar_investidor(self.ctx)
+        with self.assertRaises(RuntimeError):
+            with self.ctx.db.transacao():
+                self.ctx.db.executar("UPDATE contas SET saldo_disponivel = '1' WHERE investidor_id = ?", (inv.id,))
+                raise RuntimeError("falha no meio")
+        self.assertEqual(self.ctx.usuarios.buscar_por_id(inv.id).conta.saldo_disponivel, Decimal("10000.00"))
+
+
+if __name__ == "__main__":
+    unittest.main()
