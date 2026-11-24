@@ -1,0 +1,12 @@
+-- SentinelTrade: dados de demonstração (apenas ativos simulados).
+-- Uso:  sqlite3 sentineltrade.db < database/schema.sql
+--       sqlite3 sentineltrade.db < database/seed.sql
+--
+-- Usuários NÃO ficam aqui: senhas e segredos do MFA não devem ser gravados em arquivo versionado.
+-- Para criar o administrador e o investidor de demonstração, rode:  python main.py seed
+
+INSERT OR IGNORE INTO ativos (codigo, nome, preco_atual, mercado_aberto) VALUES
+    ('PETR4', 'Petrobras PN',      '30.00', 1),
+    ('VALE3', 'Vale ON',           '60.00', 1),
+    ('ITUB4', 'Itaú Unibanco PN',  '32.50', 1),
+    ('MGLU3', 'Magazine Luiza ON', '10.00', 0);  -- mercado fechado, para testar a rejeição
