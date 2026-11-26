@@ -1,0 +1,40 @@
+"""Demonstração da API em execução (suba antes com: python main.py).  Uso: python scripts/demo_api.py"""
+import json
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+BASE = "http://127.0.0.1:8000"
+
+
+def chamar(metodo, caminho, corpo=None, token=None):
+    req = urllib.request.Request(BASE + caminho, method=metodo,
+                                 data=json.dumps(corpo).encode() if corpo else None)
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+print("1. Login");  st, r = chamar("POST", "/login", {"email": "investidor@orion.com", "senha": "Senha@12345"})
+print("  ", st, r["etapa"])
+parcial = r["token"]
+codigo = subprocess.run([sys.executable, "-m", "sentineltrade.dados_demo", "codigo", "investidor@orion.com"],
+                        capture_output=True, text=True).stdout.strip()
+print("2. MFA");  st, r = chamar("POST", "/mfa", {"token_parcial": parcial, "codigo": codigo})
+print("  ", st, r["etapa"])
+token = r["token"]
+ordem = {"ativo": "PETR4", "tipo": "COMPRA", "quantidade": 10, "preco": "35.50",
+         "chave_idempotencia": "demo-api-0001"}
+print("3. Ordem de compra");  st, r = chamar("POST", "/ordens", ordem, token)
+print("  ", st, r["estado"], r["id"])
+print("4. Mesma chave de novo");  st, r2 = chamar("POST", "/ordens", ordem, token)
+print("  ", st, "mesma ordem:", r2["id"] == r["id"])
+print("5. Carteira");  print("  ", chamar("GET", "/carteira", token=token)[1])
+print("6. Entrada maliciosa");  ordem["ativo"] = "'; DROP TABLE ordens;--"; ordem["chave_idempotencia"] = "demo-api-0002"
+print("  ", chamar("POST", "/ordens", ordem, token))
