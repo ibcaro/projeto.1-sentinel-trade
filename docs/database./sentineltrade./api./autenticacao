@@ -1,0 +1,20 @@
+from fastapi import APIRouter, Depends
+
+from ..dependencias import obter_servicos
+from ..esquemas import LoginEntrada, MfaEntrada, TokenSaida
+
+router = APIRouter(tags=["Autenticação"])
+
+
+@router.post("/login", response_model=TokenSaida)
+def login(dados: LoginEntrada, servicos=Depends(obter_servicos)):
+    """Passo 1: e-mail e senha. Devolve um token parcial para o passo do MFA."""
+    token = servicos.autenticacao.login(dados.email, dados.senha)
+    return TokenSaida(token=token, etapa="mfa_pendente")
+
+
+@router.post("/mfa", response_model=TokenSaida)
+def mfa(dados: MfaEntrada, servicos=Depends(obter_servicos)):
+    """Passo 2: código de 6 dígitos. Devolve o token de acesso (vale 15 minutos)."""
+    token = servicos.autenticacao.verificar_mfa(dados.token_parcial, dados.codigo)
+    return TokenSaida(token=token, etapa="autenticado")
