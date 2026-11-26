@@ -1,0 +1,71 @@
+"""Demonstração no terminal, sem precisar subir a API.  Uso: python scripts/demo_terminal.py"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sentineltrade.dados_demo import SENHA_DEMO, popular_demo          # noqa: E402
+from sentineltrade.dominio.excecoes import ErroDeDominio               # noqa: E402
+from sentineltrade.servicos.contexto import criar_servicos             # noqa: E402
+from sentineltrade.servicos.seguranca import gerar_codigo              # noqa: E402
+
+
+def passo(texto):
+    print(f"\n=== {texto}")
+
+
+s = criar_servicos(":memory:", "chave-de-demonstracao-com-mais-de-32-caracteres")
+popular_demo(s)
+inv = s.repo_usuarios.obter_por_email("investidor@orion.com")
+
+passo("1. Login com senha e segundo fator (MFA)")
+parcial = s.autenticacao.login("investidor@orion.com", SENHA_DEMO)
+print("Senha correta. Token parcial emitido.")
+codigo = gerar_codigo(inv.segredo_mfa, s.relogio())
+token = s.autenticacao.verificar_mfa(parcial, codigo)
+usuario = s.autenticacao.validar_token(token)
+print(f"Código MFA aceito. Acesso liberado para {usuario.email} (token vale 15 minutos).")
+
+passo("2. Carteira inicial")
+c = s.ordens.consultar_carteira(usuario)
+print(f"Saldo: R$ {c['saldo']}  |  Limite de risco: R$ {c['limite_risco']}  |  Posições: {c['posicoes']}")
+
+passo("3. Ordem de compra: 100 PETR4 a R$ 35,50")
+o = s.ordens.enviar(usuario, "PETR4", "COMPRA", 100, "35.50", "demo-compra-0001")
+print(f"Estado: {o.estado.value}")
+
+passo("4. Mesma chave de idempotência de novo: não duplica")
+o2 = s.ordens.enviar(usuario, "PETR4", "COMPRA", 100, "35.50", "demo-compra-0001")
+print(f"Mesma ordem devolvida: {o2.id == o.id}  |  Ordens no sistema: {len(s.ordens.consultar(usuario))}")
+
+passo("5. Ordem acima do limite de risco (R$ 100.000 > R$ 50.000)")
+o3 = s.ordens.enviar(usuario, "VALE3", "COMPRA", 1000, "100.00", "demo-risco-0001")
+print(f"Estado: {o3.estado.value}  |  Motivo: {o3.motivo}")
+
+passo("6. Bolsa fora do ar: reenvia 3 vezes, ordem fica em FALHA e o saldo volta")
+s.bolsa.fora_do_ar = True
+saldo_antes = s.ordens.consultar_carteira(usuario)["saldo"]
+tentativas_antes = s.bolsa.tentativas
+o4 = s.ordens.enviar(usuario, "PETR4", "COMPRA", 10, "35.50", "demo-falha-0001")
+saldo_depois = s.ordens.consultar_carteira(usuario)["saldo"]
+print(f"Estado: {o4.estado.value}  |  Tentativas na Bolsa: {s.bolsa.tentativas - tentativas_antes}")
+print(f"Saldo antes: R$ {saldo_antes}  |  depois: R$ {saldo_depois}  (iguais: {saldo_antes == saldo_depois})")
+s.bolsa.fora_do_ar = False
+
+passo("7. Cancelar ordem já executada: não pode")
+try:
+    s.ordens.cancelar(usuario, o.id)
+except ErroDeDominio as erro:
+    print(f"Recusado: {erro.mensagem_publica}")
+
+passo("8. Auditoria (administrador) e verificação da cadeia de hashes")
+adm = s.repo_usuarios.obter_por_email("admin@orion.com")
+for log in reversed(s.auditoria.consultar(adm, limite=6)):
+    print(f"  #{log.id:<3} {log.evento:<24} hash={log.hash_registro[:12]}...")
+print("Cadeia íntegra:", s.auditoria.verificar_integridade()[0])
+
+passo("9. Tentativa de adulterar um log")
+try:
+    s.banco.executar("UPDATE logs_auditoria SET detalhes = 'x' WHERE id = 1")
+except Exception as erro:
+    print(f"Banco recusou: {erro}")
