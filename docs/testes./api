@@ -1,0 +1,101 @@
+"""Testes da camada de API (BFF). Rodam só se fastapi e httpx estiverem instalados."""
+import importlib.util
+import unittest
+
+from sentineltrade.dados_demo import SENHA_DEMO, popular_demo
+from sentineltrade.servicos.contexto import criar_servicos
+from sentineltrade.servicos.seguranca import gerar_codigo
+
+TEM_FASTAPI = all(importlib.util.find_spec(m) for m in ("fastapi", "httpx"))
+CHAVE_SECRETA = "chave-de-teste-com-mais-de-32-caracteres!"
+
+
+@unittest.skipUnless(TEM_FASTAPI, "fastapi/httpx não instalados (pip install -r requirements.txt)")
+class TestApi(unittest.TestCase):
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from sentineltrade.api.app import criar_app
+        self.s = criar_servicos(":memory:", CHAVE_SECRETA)
+        popular_demo(self.s)
+        self.client = TestClient(criar_app(self.s), raise_server_exceptions=False)
+
+    def entrar(self, email):
+        usuario = self.s.repo_usuarios.obter_por_email(email)
+        r = self.client.post("/login", json={"email": email, "senha": SENHA_DEMO})
+        self.assertEqual(r.status_code, 200)
+        codigo = gerar_codigo(usuario.segredo_mfa, self.s.relogio())
+        r = self.client.post("/mfa", json={"token_parcial": r.json()["token"], "codigo": codigo})
+        self.assertEqual(r.status_code, 200)
+        return {"Authorization": f"Bearer {r.json()['token']}"}
+
+    def ordem(self, chave="api-chave-0001", **extra):
+        corpo = {"ativo": "PETR4", "tipo": "COMPRA", "quantidade": 10, "preco": "10.00",
+                 "chave_idempotencia": chave}
+        corpo.update(extra)
+        return corpo
+
+    def test_saude(self):
+        self.assertEqual(self.client.get("/saude").json(), {"status": "ok"})
+
+    def test_fluxo_completo_login_mfa_e_ordem_executada(self):
+        h = self.entrar("investidor@orion.com")
+        r = self.client.post("/ordens", json=self.ordem(), headers=h)
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()["estado"], "EXECUTADA")
+        self.assertEqual(len(self.client.get("/ordens", headers=h).json()), 1)
+
+    def test_ordem_repetida_nao_duplica(self):
+        h = self.entrar("investidor@orion.com")
+        a = self.client.post("/ordens", json=self.ordem(), headers=h).json()
+        b = self.client.post("/ordens", json=self.ordem(), headers=h).json()
+        self.assertEqual(a["id"], b["id"])
+        self.assertEqual(len(self.client.get("/ordens", headers=h).json()), 1)
+
+    def test_sem_token_da_401(self):
+        self.assertEqual(self.client.post("/ordens", json=self.ordem()).status_code, 401)
+
+    def test_token_falso_da_401(self):
+        r = self.client.get("/ordens", headers={"Authorization": "Bearer falso.falso"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_entrada_invalida_da_422_sem_detalhes_internos(self):
+        h = self.entrar("investidor@orion.com")
+        r = self.client.post("/ordens", json=self.ordem(ativo="'; DROP TABLE ordens;--"), headers=h)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json(), {"erro": "Dados inválidos."})
+
+    def test_campo_extra_e_recusado(self):
+        h = self.entrar("investidor@orion.com")
+        r = self.client.post("/ordens", json=self.ordem(admin=True), headers=h)
+        self.assertEqual(r.status_code, 422)
+
+    def test_investidor_nao_acessa_auditoria(self):
+        h = self.entrar("investidor@orion.com")
+        self.assertEqual(self.client.get("/auditoria", headers=h).status_code, 403)
+
+    def test_administrador_consulta_auditoria(self):
+        h = self.entrar("admin@orion.com")
+        r = self.client.get("/auditoria", headers=h)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(len(r.json()) > 0)
+
+    def test_login_com_senha_errada_da_401_mensagem_generica(self):
+        r = self.client.post("/login", json={"email": "investidor@orion.com", "senha": "senha-errada-1"})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json(), {"erro": "Credenciais inválidas."})
+
+    def test_cancelar_ordem_executada_da_409(self):
+        h = self.entrar("investidor@orion.com")
+        ordem = self.client.post("/ordens", json=self.ordem(), headers=h).json()
+        r = self.client.delete(f"/ordens/{ordem['id']}", headers=h)
+        self.assertEqual(r.status_code, 409)
+
+    def test_carteira(self):
+        h = self.entrar("investidor@orion.com")
+        r = self.client.get("/carteira", headers=h)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("posicoes", r.json())
+
+
+if __name__ == "__main__":
+    unittest.main()
