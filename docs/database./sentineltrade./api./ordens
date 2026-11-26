@@ -1,0 +1,31 @@
+from fastapi import APIRouter, Depends, status
+
+from ..dependencias import obter_servicos, usuario_atual
+from ..esquemas import CarteiraSaida, OrdemEntrada, OrdemSaida, ordem_para_saida
+
+router = APIRouter(tags=["Ordens"])
+
+
+@router.post("/ordens", response_model=OrdemSaida, status_code=status.HTTP_201_CREATED)
+def enviar_ordem(dados: OrdemEntrada, usuario=Depends(usuario_atual),
+                 servicos=Depends(obter_servicos)):
+    """Envia uma ordem. Repetir a mesma chave de idempotência devolve a ordem original."""
+    ordem = servicos.ordens.enviar(usuario, dados.ativo, dados.tipo, dados.quantidade,
+                                   dados.preco, dados.chave_idempotencia)
+    return ordem_para_saida(ordem)
+
+
+@router.get("/ordens", response_model=list[OrdemSaida])
+def consultar_ordens(usuario=Depends(usuario_atual), servicos=Depends(obter_servicos)):
+    return [ordem_para_saida(o) for o in servicos.ordens.consultar(usuario)]
+
+
+@router.delete("/ordens/{ordem_id}", response_model=OrdemSaida)
+def cancelar_ordem(ordem_id: str, usuario=Depends(usuario_atual),
+                   servicos=Depends(obter_servicos)):
+    return ordem_para_saida(servicos.ordens.cancelar(usuario, ordem_id))
+
+
+@router.get("/carteira", response_model=CarteiraSaida)
+def consultar_carteira(usuario=Depends(usuario_atual), servicos=Depends(obter_servicos)):
+    return servicos.ordens.consultar_carteira(usuario)
