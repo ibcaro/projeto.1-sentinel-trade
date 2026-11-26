@@ -1,0 +1,160 @@
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import struct
+from datetime import datetime
+
+from ..dominio.excecoes import TokenInvalido
+
+PASSO_MFA_SEGUNDOS = 30
+JANELA_MFA = 1
+
+
+def hash_senha(senha):
+    sal = os.urandom(16)
+    h = hashlib.scrypt(
+        senha.encode(),
+        salt=sal,
+        n=2**14,
+        r=8,
+        p=1,
+        dklen=32
+    )
+    return f"scrypt${sal.hex()}${h.hex()}"
+
+
+def verificar_senha(senha, armazenado):
+    try:
+        _, sal_hex, h_hex = armazenado.split("$")
+        h = hashlib.scrypt(
+            senha.encode(),
+            salt=bytes.fromhex(sal_hex),
+            n=2**14,
+            r=8,
+            p=1,
+            dklen=32
+        )
+    except (ValueError, TypeError):
+        return False
+
+    return hmac.compare_digest(h.hex(), h_hex)
+
+
+def gerar_segredo_mfa():
+    return base64.b32encode(secrets.token_bytes(20)).decode()
+
+
+def passo_atual(agora):
+    return int(agora.timestamp()) // PASSO_MFA_SEGUNDOS
+
+
+def _hotp(segredo, contador):
+    chave = base64.b32decode(segredo)
+    digest = hmac.new(
+        chave,
+        struct.pack(">Q", contador),
+        hashlib.sha1
+    ).digest()
+
+    desloc = digest[-1] & 0x0F
+    numero = (
+        struct.unpack(">I", digest[desloc:desloc + 4])[0]
+        & 0x7FFFFFFF
+    ) % 1000000
+
+    return f"{numero:06d}"
+
+
+def gerar_codigo(segredo, agora):
+    return _hotp(segredo, passo_atual(agora))
+
+
+def verificar_codigo(segredo, codigo, agora, ultimo_passo):
+    atual = passo_atual(agora)
+
+    for passo in range(
+        atual - JANELA_MFA,
+        atual + JANELA_MFA + 1
+    ):
+        if passo > ultimo_passo:
+            if hmac.compare_digest(_hotp(segredo, passo), codigo):
+                return passo
+
+    return None
+
+
+def _b64(dados):
+    return base64.urlsafe_b64encode(dados).rstrip(b"=").decode()
+
+
+def _desb64(texto):
+    return base64.urlsafe_b64decode(
+        texto + "=" * (-len(texto) % 4)
+    )
+
+
+class EmissorToken:
+
+    def __init__(self, chave_secreta):
+        if not chave_secreta or len(chave_secreta) < 32:
+            raise ValueError(
+                "A chave secreta precisa ter ao menos 32 caracteres."
+            )
+
+        self._chave = chave_secreta.encode()
+
+    def _assinar(self, corpo):
+        return _b64(
+            hmac.new(
+                self._chave,
+                corpo.encode(),
+                hashlib.sha256
+            ).digest()
+        )
+
+    def emitir(self, usuario_id, etapa, validade_segundos, agora):
+        carga = {
+            "sub": usuario_id,
+            "eta": etapa,
+            "exp": int(agora.timestamp()) + validade_segundos
+        }
+
+        corpo = _b64(
+            json.dumps(
+                carga,
+                sort_keys=True,
+                separators=(",", ":")
+            ).encode()
+        )
+
+        return f"{corpo}.{self._assinar(corpo)}"
+
+    def validar(self, token, etapa, agora):
+        try:
+            corpo, assinatura = token.split(".")
+
+            if not hmac.compare_digest(
+                assinatura,
+                self._assinar(corpo)
+            ):
+                raise TokenInvalido()
+
+            carga = json.loads(_desb64(corpo))
+
+            if carga["eta"] != etapa:
+                raise TokenInvalido()
+
+            if int(agora.timestamp()) >= int(carga["exp"]):
+                raise TokenInvalido()
+
+            return str(carga["sub"])
+
+        except TokenInvalido:
+            raise
+
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise TokenInvalido() from None
