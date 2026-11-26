@@ -1,0 +1,17 @@
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
+
+from ...dominio.validacao import PADRAO_EVENTO
+from ..dependencias import exigir_administrador, obter_servicos
+from ..esquemas import LogSaida
+
+router = APIRouter(tags=["Auditoria"])
+
+
+@router.get("/auditoria", response_model=list[LogSaida])
+def consultar_logs(evento: Optional[str] = Query(default=None, pattern=f"^{PADRAO_EVENTO}$"),
+                   limite: int = Query(default=50, ge=1, le=200),
+                   admin=Depends(exigir_administrador), servicos=Depends(obter_servicos)):
+    """Somente administrador. A própria consulta também é registrada no log."""
+    return servicos.auditoria.consultar(admin, evento=evento, limite=limite)
